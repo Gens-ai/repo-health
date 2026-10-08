@@ -25,6 +25,35 @@ repo-health scan --all     # scan every registered repo; reports land in ~/secur
 The first trivy run downloads its vulnerability database (a few hundred MB),
 so it takes a minute. Later runs are fast.
 
+## Setting up the crons
+
+Scans and pings have very different costs, so they run on different schedules:
+
+- **Dependency/code scans are expensive and change slowly.** A scan reads every
+  lockfile, runs several scanners and checks large vulnerability databases. Its
+  results only change when you push code or a new CVE is published, so
+  scanning every few minutes finds nothing new. **Nightly** is right. With
+  `scan --all`, you're only notified about **new** findings compared with the
+  previous run's JSON report (matched by tool, finding/CVE ID, location and
+  package), so a known, unfixed issue doesn't wake you every night. The full
+  report is still written every time.
+- **Health pings are nearly free** (one HTTP GET) and outages matter within
+  minutes, so run them **often**: every 1–5 minutes.
+
+Run `crontab -e` and add (`repo-health init` prints these with your real path
+and a per-install staggered scan time, so many installs don't hit vulnerability
+databases at exactly the same moment):
+
+```cron
+0 2 * * * /path/to/repo-health scan --all   # nightly, staggered per install
+*/5 * * * * /path/to/repo-health ping --all # every 5 min
+```
+
+Cron has a minimal environment. If trivy/semgrep live in `~/.local/bin`, add a
+`PATH=...` line at the top of your crontab. If you use `HEALTH_AUTH_HEADER`,
+define those variables there too. Each run appends a one-line summary to
+`repo-health.log` in the repo-health home directory.
+
 ## Subcommand reference
 
 | Command | What it does |
@@ -286,35 +315,6 @@ Notifications are sent only when the status changes: into **DOWN**, into
 an hour sends one alert, not twelve. State is kept in `targets.d/<name>.state`.
 If a notification fails to send, the state change isn't recorded, so the
 next ping retries the alert.
-
-## Scheduling (cron)
-
-Scans and pings have very different costs, so they run on different schedules:
-
-- **Dependency/code scans are expensive and change slowly.** A scan reads every
-  lockfile, runs several scanners and checks large vulnerability databases. Its
-  results only change when you push code or a new CVE is published, so
-  scanning every few minutes finds nothing new. **Nightly** is right. With
-  `scan --all`, you're only notified about **new** findings compared with the
-  previous run's JSON report (matched by tool, finding/CVE ID, location and
-  package), so a known, unfixed issue doesn't wake you every night. The full
-  report is still written every time.
-- **Health pings are nearly free** (one HTTP GET) and outages matter within
-  minutes, so run them **often**: every 1–5 minutes.
-
-Run `crontab -e` and add (`repo-health init` prints these with your real path
-and a per-install staggered scan time, so many installs don't hit vulnerability
-databases at exactly the same moment):
-
-```cron
-0 2 * * * /path/to/repo-health scan --all   # nightly, staggered per install
-*/5 * * * * /path/to/repo-health ping --all # every 5 min
-```
-
-Cron has a minimal environment. If trivy/semgrep live in `~/.local/bin`, add a
-`PATH=...` line at the top of your crontab. If you use `HEALTH_AUTH_HEADER`,
-define those variables there too. Each run appends a one-line summary to
-`repo-health.log` in the repo-health home directory.
 
 ## CI usage
 
