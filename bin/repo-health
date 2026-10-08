@@ -1,0 +1,699 @@
+#!/usr/bin/env bash
+# repo-health — free, local, unlimited dependency/code scanning plus
+# health-endpoint monitoring for any git repo or running service.
+# https://github.com/Gens-ai/repo-health — MIT License
+#
+# Runs on bash 3.2+ (stock macOS) and Linux; needs curl, optionally jq and
+# whatever scanners are installed (trivy, semgrep, composer, npm, pip-audit).
+
+set -uo pipefail
+
+RH_VERSION="0.1.0"
+
+# --- locate the install dir (resolve symlinks without GNU readlink -f) ------
+_rh_src="${BASH_SOURCE[0]}"
+while [ -L "$_rh_src" ]; do
+  _rh_dir="$(cd -P "$(dirname "$_rh_src")" && pwd)"
+  _rh_src="$(readlink "$_rh_src")"
+  case "$_rh_src" in /*) ;; *) _rh_src="$_rh_dir/$_rh_src" ;; esac
+done
+RH_ROOT="$(cd -P "$(dirname "$_rh_src")/.." && pwd)"
+RH_SELF="$RH_ROOT/bin/repo-health"
+unset _rh_src _rh_dir
+
+RH_HOME="${REPO_HEALTH_HOME:-$RH_ROOT}"
+RH_CONF="${REPO_HEALTH_CONF:-$RH_HOME/repo-health.conf}"
+RH_TARGETS="$RH_HOME/targets.d"
+RH_CACHE="$RH_HOME/cache"
+RH_LOG="$RH_HOME/repo-health.log"
+
+# --- output helpers ---------------------------------------------------------
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  _C_RED=$'\033[31m' _C_YEL=$'\033[33m' _C_GRN=$'\033[32m' _C_DIM=$'\033[2m' _C_OFF=$'\033[0m'
+else
+  _C_RED="" _C_YEL="" _C_GRN="" _C_DIM="" _C_OFF=""
+fi
+rh_info() { printf '%s%s%s\n' "$_C_DIM" "$*" "$_C_OFF" >&2; }
+rh_ok()   { printf '%s%s%s\n' "$_C_GRN" "$*" "$_C_OFF" >&2; }
+rh_warn() { printf '%swarning:%s %s\n' "$_C_YEL" "$_C_OFF" "$*" >&2; }
+rh_err()  { printf '%serror:%s %s\n' "$_C_RED" "$_C_OFF" "$*" >&2; }
+rh_die()  { rh_err "$*"; exit 2; }
+rh_log()  { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$RH_LOG" 2>/dev/null || true; }
+
+. "$RH_ROOT/lib/notify.sh"
+. "$RH_ROOT/lib/detect-stack.sh"
+. "$RH_ROOT/lib/detect-health-format.sh"
+. "$RH_ROOT/lib/scan.sh"
+. "$RH_ROOT/lib/ping.sh"
+
+# --- config parsing ---------------------------------------------------------
+# Config files are parsed, never sourced: the per-target file has a PATH= key
+# that would clobber $PATH, and parsing means a config file can't run code.
+#
+# rh_parse_conf <file> <var-prefix> <allowed KEYS...>
+# Accepts KEY=value, KEY="value", KEY='value'; '#' starts a comment when it is
+# at line start or preceded by whitespace in an unquoted value; a leading ~ or
+# $HOME expands to the home directory.
+rh_parse_conf() {
+  local file=$1 prefix=$2 line key val
+  shift 2
+  local allowed=" $* "
+  [ -r "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; *=*) ;; *) continue ;; esac
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    case "$allowed" in *" $key "*) ;; *) continue ;; esac
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    case "$val" in
+      \"*) val="${val#\"}"; val="${val%%\"*}" ;;
+      \'*) val="${val#\'}"; val="${val%%\'*}" ;;
+      *)   val="${val%%[[:space:]]#*}"; val="${val%"${val##*[![:space:]]}"}" ;;
+    esac
+    case "$val" in
+      '~')          val=$HOME ;;
+      '~/'*)        val="$HOME/${val#\~/}" ;;
+      '$HOME'|'${HOME}') val=$HOME ;;
+      '$HOME/'*)    val="$HOME/${val#\$HOME/}" ;;
+      '${HOME}/'*)  val="$HOME/${val#\$\{HOME\}/}" ;;
+    esac
+    printf -v "$prefix$key" '%s' "$val"
+  done < "$file"
+}
+
+# rh_kv KEY VALUE — one config line, quoted only when needed.
+rh_kv() {
+  case "$2" in
+    *[[:space:]#\']*|'') printf '%s="%s"\n' "$1" "$2" ;;
+    *\"*)               printf "%s='%s'\n" "$1" "$2" ;;
+    *)                  printf '%s=%s\n' "$1" "$2" ;;
+  esac
+}
+
+RH_GLOBAL_KEYS="NOTIFY_CHANNEL NOTIFY_TARGET REPORT_DIR SEMGREP_CONFIG PING_TIMEOUT"
+RH_TARGET_KEYS="NAME MODE PATH HEALTH_URL HEALTH_STATUS_JSONPATH HEALTH_AUTH_HEADER GIT_URL"
+
+rh_load_global() {
+  NOTIFY_CHANNEL="" NOTIFY_TARGET="" REPORT_DIR="$HOME/security-scans" SEMGREP_CONFIG=auto PING_TIMEOUT=10
+  RH_HAVE_CONF=0
+  if [ -f "$RH_CONF" ]; then
+    rh_parse_conf "$RH_CONF" "" $RH_GLOBAL_KEYS || rh_die "cannot read $RH_CONF"
+    RH_HAVE_CONF=1
+  fi
+  case "$PING_TIMEOUT" in ''|*[!0-9]*) PING_TIMEOUT=10 ;; esac
+}
+
+rh_valid_name() {
+  case "$1" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# rh_slug <text> — turn a basename/host into a valid target name.
+rh_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9._-]/-/g' -e 's/--*/-/g' -e 's/^[^a-z0-9]*//' -e 's/-*$//'
+}
+
+rh_target_file() { printf '%s/%s.conf' "$RH_TARGETS" "$1"; }
+
+rh_target_names() {
+  local f
+  for f in "$RH_TARGETS"/*.conf; do
+    [ -f "$f" ] || continue
+    f=${f##*/}
+    printf '%s\n' "${f%.conf}"
+  done
+}
+
+# rh_load_target <name> — populate T_* variables from targets.d/<name>.conf.
+rh_load_target() {
+  local file
+  file=$(rh_target_file "$1")
+  T_NAME="" T_MODE="" T_PATH="" T_HEALTH_URL="" T_HEALTH_STATUS_JSONPATH="" T_HEALTH_AUTH_HEADER="" T_GIT_URL=""
+  [ -f "$file" ] || return 1
+  rh_parse_conf "$file" T_ $RH_TARGET_KEYS || return 1
+  [ -n "$T_NAME" ] || T_NAME=$1
+  case "$T_MODE" in scan|ping|both) ;; *) rh_warn "$1: invalid MODE '$T_MODE' in $file"; return 1 ;; esac
+  return 0
+}
+
+rh_write_target() {
+  local file
+  file=$(rh_target_file "$T_NAME")
+  ( umask 077; mkdir -p "$RH_TARGETS" )
+  (
+    umask 077
+    {
+      printf '# repo-health target — edit with: repo-health edit %s\n' "$T_NAME"
+      rh_kv NAME "$T_NAME"
+      printf '%s   # scan | ping | both\n' "$(rh_kv MODE "$T_MODE")"
+      rh_kv PATH "$T_PATH"
+      rh_kv HEALTH_URL "$T_HEALTH_URL"
+      printf '# Optional: jq path for custom health JSON, e.g. .data.ok\n'
+      rh_kv HEALTH_STATUS_JSONPATH "$T_HEALTH_STATUS_JSONPATH"
+      printf '# Optional: "Header-Name: ENV_VAR_NAME" — the value is read from that env var, never stored here\n'
+      rh_kv HEALTH_AUTH_HEADER "$T_HEALTH_AUTH_HEADER"
+      [ -n "$T_GIT_URL" ] && rh_kv GIT_URL "$T_GIT_URL"
+    } > "$file"
+  )
+  chmod 600 "$file"
+}
+
+rh_ask() { # rh_ask <prompt> [default] — reads a line from stdin; prints answer
+  local ans
+  if ! IFS= read -r -p "$1" ans; then ans=""; echo >&2; fi
+  [ -n "$ans" ] || ans=${2:-}
+  printf '%s' "$ans"
+}
+
+rh_yes() { # rh_yes <prompt> <default y|n>
+  local a
+  a=$(rh_ask "$1" "$2")
+  case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+# --- subcommands ------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+repo-health $RH_VERSION — free local dependency/code scanning + health-endpoint monitoring
+
+Usage:
+  repo-health init                              set up notification channel (writes repo-health.conf)
+  repo-health doctor                            check installed tools, print install commands
+  repo-health add <path> [--url <health-url>]   register a local repo (optionally also health-ping it)
+  repo-health add --git <url> [--name X]        shallow-clone a repo into the cache and register it
+  repo-health add --url <health-url> [--name X] health-ping-only target
+  repo-health list                              show registered targets
+  repo-health remove <name>                     unregister a target
+  repo-health edit <name>                       open targets.d/<name>.conf in \$EDITOR
+  repo-health scan [<name>|<path>|--all]        dependency/code scan (exit 1 on HIGH/CRITICAL)
+  repo-health ping [<name>|--all]               health-endpoint check (exit 1 if any DOWN)
+  repo-health notify-test                       send a test notification
+  repo-health version | help
+
+add options:   --name X  --jsonpath .data.ok  --auth-header "X-Token: ENV_VAR"  --force
+scan options:  --notify (notify new findings for a single target)  --no-notify  --report-dir DIR
+
+Config: $RH_CONF
+Targets: $RH_TARGETS/
+EOF
+}
+
+cmd_add() {
+  local path="" git="" url="" name="" jsonpath="" auth="" force=0 file host
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --git)          [ $# -ge 2 ] || rh_die "--git needs a URL"; git=$2; shift 2 ;;
+      --url)          [ $# -ge 2 ] || rh_die "--url needs a URL"; url=$2; shift 2 ;;
+      --name)         [ $# -ge 2 ] || rh_die "--name needs a value"; name=$2; shift 2 ;;
+      --jsonpath)     [ $# -ge 2 ] || rh_die "--jsonpath needs a value"; jsonpath=$2; shift 2 ;;
+      --auth-header)  [ $# -ge 2 ] || rh_die "--auth-header needs a value"; auth=$2; shift 2 ;;
+      --force|-f)     force=1; shift ;;
+      -h|--help)      usage; return 0 ;;
+      -*)             rh_die "unknown option for add: $1" ;;
+      *)              [ -z "$path" ] || rh_die "add takes one path (got '$path' and '$1')"; path=$1; shift ;;
+    esac
+  done
+  [ -n "$path" ] && [ -n "$git" ] && rh_die "use either a local <path> or --git <url>, not both"
+  [ -n "$path$git$url" ] || rh_die "usage: repo-health add <path> | --git <url> | --url <health-url>"
+
+  if [ -n "$url" ]; then
+    case "$url" in http://*|https://*) ;; *) rh_die "--url must start with http:// or https://" ;; esac
+  fi
+  if [ -n "$auth" ]; then
+    case "$auth" in *:*) ;; *) rh_die "--auth-header must look like 'Header-Name: ENV_VAR_NAME'" ;; esac
+  fi
+
+  # Default names: repo basename, git repo name, or health URL host.
+  if [ -z "$name" ]; then
+    if [ -n "$git" ]; then
+      name=${git%/}; name=${name##*/}; name=${name##*:}; name=${name%.git}
+    elif [ -n "$path" ]; then
+      [ -d "$path" ] || rh_die "not a directory: $path"
+      name=$(basename "$(cd "$path" && pwd -P)")
+    else
+      host=${url#*://}; host=${host%%/*}; host=${host##*@}; host=${host%%:*}
+      name=$host
+    fi
+    name=$(rh_slug "$name")
+  fi
+  rh_valid_name "$name" || rh_die "invalid target name '$name' (use letters, digits, . _ -; pass --name)"
+  file=$(rh_target_file "$name")
+  if [ -f "$file" ] && [ "$force" != 1 ]; then
+    rh_die "target '$name' already exists ($file). Use --name to pick another name, or --force to replace."
+  fi
+
+  if [ -n "$git" ]; then
+    command -v git >/dev/null 2>&1 || rh_die "git is not installed"
+    path="$RH_CACHE/$name"
+    if [ -e "$path" ]; then
+      [ "$force" = 1 ] || rh_die "cache dir $path already exists (use --force to re-clone)"
+      rm -rf "$path"
+    fi
+    ( umask 077; mkdir -p "$RH_CACHE" )
+    rh_info "cloning $git (shallow) into $path…"
+    git clone --depth 1 -q -- "$git" "$path" || rh_die "git clone failed"
+  elif [ -n "$path" ]; then
+    [ -d "$path" ] || rh_die "not a directory: $path"
+    path=$(cd "$path" && pwd -P)
+  fi
+
+  T_NAME=$name T_PATH=$path T_HEALTH_URL=$url T_HEALTH_STATUS_JSONPATH=$jsonpath
+  T_HEALTH_AUTH_HEADER=$auth T_GIT_URL=$git
+  if [ -n "$path" ] && [ -n "$url" ]; then T_MODE=both
+  elif [ -n "$path" ]; then T_MODE=scan
+  else T_MODE=ping
+  fi
+  rh_write_target
+
+  rh_ok "added target '$name' (mode: $T_MODE) -> $file"
+  if [ -n "$path" ]; then
+    local stacks
+    stacks=$(rh_detect_stack "$path")
+    if [ -n "$stacks" ]; then
+      echo "  detected stack: $stacks"
+    else
+      echo "  no known manifests found — trivy will still check for secrets and misconfigurations"
+    fi
+    echo "  run a scan now:  repo-health scan $name"
+  fi
+  [ -n "$url" ] && echo "  check it now:    repo-health ping $name"
+  return 0
+}
+
+cmd_list() {
+  local n count=0 where
+  printf '%-24s %-5s %s\n' NAME MODE PATH/URL
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if rh_load_target "$n"; then
+      case "$T_MODE" in
+        scan) where=$T_PATH ;;
+        ping) where=$T_HEALTH_URL ;;
+        both) where="$T_PATH  +  $T_HEALTH_URL" ;;
+      esac
+      printf '%-24s %-5s %s\n' "$n" "$T_MODE" "$where"
+    else
+      printf '%-24s %-5s %s\n' "$n" "?" "(invalid config: $(rh_target_file "$n"))"
+    fi
+    count=$((count + 1))
+  done < <(rh_target_names)
+  [ "$count" -gt 0 ] || rh_info "no targets yet — add one with: repo-health add <path> | --git <url> | --url <health-url>"
+  return 0
+}
+
+cmd_remove() {
+  [ $# -eq 1 ] || rh_die "usage: repo-health remove <name>"
+  local name=$1 file
+  rh_valid_name "$name" || rh_die "invalid target name '$name'"
+  file=$(rh_target_file "$name")
+  [ -f "$file" ] || rh_die "no such target: $name"
+  rh_load_target "$name" || true
+  rm -f "$file" "$RH_TARGETS/$name.state"
+  # Only ever delete clones that repo-health itself created.
+  if [ -n "$T_PATH" ] && [ "$T_PATH" = "$RH_CACHE/$name" ] && [ -d "$T_PATH" ]; then
+    rm -rf "$T_PATH"
+    rh_info "removed cached clone $T_PATH"
+  fi
+  rh_ok "removed target '$name' (reports in your REPORT_DIR are kept)"
+}
+
+cmd_edit() {
+  [ $# -eq 1 ] || rh_die "usage: repo-health edit <name>"
+  local name=$1 file
+  rh_valid_name "$name" || rh_die "invalid target name '$name'"
+  file=$(rh_target_file "$name")
+  [ -f "$file" ] || rh_die "no such target: $name"
+  ${VISUAL:-${EDITOR:-vi}} "$file"
+  if rh_load_target "$name"; then
+    case "$T_MODE" in
+      scan|both) [ -d "$T_PATH" ] || rh_warn "PATH '$T_PATH' is not a directory" ;;
+    esac
+    case "$T_MODE" in
+      ping|both) case "$T_HEALTH_URL" in http://*|https://*) ;; *) rh_warn "HEALTH_URL '$T_HEALTH_URL' is not an http(s) URL" ;; esac ;;
+    esac
+  fi
+}
+
+# _rh_refresh_clone — update a repo-health-managed shallow clone before scanning.
+_rh_refresh_clone() {
+  [ -n "$T_GIT_URL" ] && [ "$T_PATH" = "$RH_CACHE/$T_NAME" ] && [ -d "$T_PATH/.git" ] || return 0
+  rh_info "updating clone of $T_GIT_URL…"
+  if ! { git -C "$T_PATH" fetch -q --depth 1 origin && git -C "$T_PATH" reset -q --hard FETCH_HEAD; }; then
+    rh_warn "$T_NAME: could not update clone, scanning the existing copy"
+  fi
+}
+
+cmd_scan() {
+  local target="" all=0 notify_mode=auto report_dir="" n rc worst=0 any=0 subject body
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)         all=1; shift ;;
+      --notify)      notify_mode=yes; shift ;;
+      --no-notify)   notify_mode=no; shift ;;
+      --report-dir)  [ $# -ge 2 ] || rh_die "--report-dir needs a value"; report_dir=$2; shift 2 ;;
+      -h|--help)     usage; return 0 ;;
+      -*)            rh_die "unknown option for scan: $1" ;;
+      *)             target=$1; shift ;;
+    esac
+  done
+  [ -n "$target" ] || all=1
+  rh_load_global
+  [ -n "$report_dir" ] && REPORT_DIR=$report_dir
+  # Diff-based notifications are the default for --all (cron); a single
+  # target only notifies when asked to (interactive / CI use).
+  [ "$notify_mode" = auto ] && { [ "$all" = 1 ] && notify_mode=yes || notify_mode=no; }
+
+  _scan_one() { # <name> <path>
+    rh_scan_target "$1" "$2" "$REPORT_DIR"; rc=$?
+    any=1
+    [ "$rc" -gt "$worst" ] && worst=$rc
+    [ "$rc" -eq 2 ] && { rh_log "scan $1: ERROR"; return; }
+    printf '%-24s %s\n' "$1" "$RH_SCAN_SUMMARY"
+    printf '%-24s report: %s\n' "" "$RH_SCAN_MD"
+    rh_log "scan $1: $RH_SCAN_SUMMARY"
+    if [ "$notify_mode" = yes ] && [ "$RH_SCAN_NEW_COUNT" -gt 0 ] && [ -n "$NOTIFY_CHANNEL" ]; then
+      subject="[repo-health] $1: $RH_SCAN_NEW_COUNT new finding(s)"
+      body="$RH_SCAN_SUMMARY"$'\n\n'"$RH_SCAN_NEW_TEXT"$'\n\n'"Report: $RH_SCAN_MD"
+      notify "$subject" "$body" || rh_warn "$1: notification failed"
+    fi
+  }
+
+  if [ "$all" = 1 ]; then
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      rh_load_target "$n" || continue
+      case "$T_MODE" in scan|both) ;; *) continue ;; esac
+      _rh_refresh_clone
+      _scan_one "$n" "$T_PATH"
+    done < <(rh_target_names)
+    [ "$any" = 1 ] || rh_info "no scan-mode targets registered (repo-health add <path>)"
+  elif rh_valid_name "$target" && [ -f "$(rh_target_file "$target")" ]; then
+    rh_load_target "$target" || rh_die "invalid target config for $target"
+    case "$T_MODE" in scan|both) ;; *) rh_die "target '$target' is ping-only (MODE=$T_MODE)" ;; esac
+    _rh_refresh_clone
+    _scan_one "$target" "$T_PATH"
+  elif [ -d "$target" ]; then
+    # Ad-hoc path (CI usage: `repo-health scan .`) — no registration needed.
+    n=$(rh_slug "$(basename "$(cd "$target" && pwd -P)")")
+    rh_valid_name "$n" || n=adhoc
+    _scan_one "$n" "$(cd "$target" && pwd -P)"
+  else
+    rh_die "'$target' is neither a registered target nor a directory"
+  fi
+  return "$worst"
+}
+
+cmd_ping() {
+  local target="" n rc worst=0 any=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)     shift ;;
+      -h|--help) usage; return 0 ;;
+      -*)        rh_die "unknown option for ping: $1" ;;
+      *)         target=$1; shift ;;
+    esac
+  done
+  rh_load_global
+  if [ -n "$target" ]; then
+    rh_valid_name "$target" && rh_load_target "$target" || rh_die "no such target: $target"
+    case "$T_MODE" in ping|both) ;; *) rh_die "target '$target' has no HEALTH_URL (MODE=$T_MODE)" ;; esac
+  fi
+  printf '%-24s %-9s %-9s %7s  %s\n' TARGET STATUS FORMAT LATENCY DETAIL
+  if [ -z "$target" ]; then
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      rh_load_target "$n" || continue
+      case "$T_MODE" in ping|both) ;; *) continue ;; esac
+      any=1
+      rh_ping_target; rc=$?
+      [ "$rc" -gt "$worst" ] && worst=$rc
+    done < <(rh_target_names)
+    [ "$any" = 1 ] || rh_info "no ping-mode targets registered (repo-health add --url <health-url>)"
+  else
+    rh_ping_target; worst=$?
+  fi
+  return "$worst"
+}
+
+cmd_notify_test() {
+  rh_load_global
+  [ "$RH_HAVE_CONF" = 1 ] || rh_die "no config at $RH_CONF — run: repo-health init"
+  [ -n "$NOTIFY_CHANNEL" ] || rh_die "NOTIFY_CHANNEL is not set in $RH_CONF"
+  rh_info "sending test notification via '$NOTIFY_CHANNEL'…"
+  if notify "repo-health test notification" \
+    "If you can read this, repo-health notifications work. Host: $(hostname 2>/dev/null || echo unknown), time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+    rh_ok "sent via $NOTIFY_CHANNEL"
+    return 0
+  fi
+  rh_err "test notification failed (channel: $NOTIFY_CHANNEL)"
+  return 1
+}
+
+# --- doctor -----------------------------------------------------------------
+
+_rh_os() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) echo macos ;;
+    Linux)  if command -v apt-get >/dev/null 2>&1; then echo debian; else echo linux; fi ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows ;;
+    *) echo unknown ;;
+  esac
+}
+
+# _rh_doctor_tool <cmd> <role> <apt> <brew> <manual> <version-cmd>
+_rh_doctor_tool() {
+  local cmd=$1 role=$2 apt=$3 brew=$4 manual=$5 vcmd=$6 v
+  if command -v "$cmd" >/dev/null 2>&1; then
+    v=$(eval "$vcmd" 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 1 | cut -c1-60)
+    printf '  %s[ok]%s      %-10s %s\n' "$_C_GRN" "$_C_OFF" "$cmd" "${v:-installed}"
+    return 0
+  fi
+  printf '  %s[missing]%s %-10s %s\n' "$_C_YEL" "$_C_OFF" "$cmd" "$role"
+  printf '              apt (Debian/Ubuntu): %s\n' "$apt"
+  printf '              brew (macOS):        %s\n' "$brew"
+  printf '              manual/docs:         %s\n' "$manual"
+  return 1
+}
+
+cmd_doctor() {
+  local missing=0 required_missing=0 os n count=0
+  os=$(_rh_os)
+  rh_load_global
+  echo "repo-health doctor (v$RH_VERSION) — OS: $os, bash $BASH_VERSION"
+  echo "Nothing is installed automatically; commands needing sudo are printed for you to run."
+  echo
+  echo "Core:"
+  _rh_doctor_tool curl "REQUIRED — health pings and notifications" \
+    "sudo apt-get install -y curl" "brew install curl" "https://curl.se/download.html" \
+    "curl --version" || required_missing=1
+  if ! _rh_doctor_tool jq "recommended — JSON parsing; without it a grep fallback handles simple health shapes and scans only use trivy's exit code" \
+    "sudo apt-get install -y jq" "brew install jq" "https://jqlang.org/download/" "jq --version"; then
+    missing=$((missing + 1))
+  fi
+  _rh_doctor_tool git "needed for: add --git" \
+    "sudo apt-get install -y git" "brew install git" "https://git-scm.com/downloads" "git --version" \
+    || missing=$((missing + 1))
+  echo
+  echo "Scanners (each one is optional; missing ones are skipped and noted in reports):"
+  _rh_doctor_tool trivy "dependency CVEs, secrets, IaC/misconfig (strongly recommended)" \
+    "run ./install.sh (installs to ~/.local/bin, no sudo) or add Aqua's apt repo per the docs" \
+    "brew install trivy" "https://trivy.dev/latest/getting-started/installation/" "trivy --version" \
+    || missing=$((missing + 1))
+  _rh_doctor_tool semgrep "SAST (code-level bugs) across many languages" \
+    "sudo apt-get install -y pipx && pipx ensurepath && pipx install semgrep" \
+    "brew install semgrep" "https://semgrep.dev/docs/getting-started/quickstart" "semgrep --version" \
+    || missing=$((missing + 1))
+  _rh_doctor_tool composer "native audit for PHP (composer.json)" \
+    "sudo apt-get install -y composer" "brew install composer" "https://getcomposer.org/download/" \
+    "composer --version --no-ansi" || missing=$((missing + 1))
+  _rh_doctor_tool npm "native audit for Node (package.json)" \
+    "sudo apt-get install -y npm" "brew install node" "https://nodejs.org/en/download" \
+    "npm --version" || missing=$((missing + 1))
+  _rh_doctor_tool pip-audit "native audit for Python (requirements.txt)" \
+    "sudo apt-get install -y pipx && pipx ensurepath && pipx install pip-audit" \
+    "brew install pip-audit" "https://pypi.org/project/pip-audit/" "pip-audit --version" \
+    || missing=$((missing + 1))
+  echo
+  echo "Configuration:"
+  if [ "$RH_HAVE_CONF" = 1 ]; then
+    printf '  [ok]      config     %s (channel: %s)\n' "$RH_CONF" "${NOTIFY_CHANNEL:-<unset>}"
+    case "$NOTIFY_CHANNEL" in
+      email)
+        if command -v sendmail >/dev/null 2>&1 || [ -x /usr/sbin/sendmail ] || command -v mail >/dev/null 2>&1; then :; else
+          printf '  %s[warn]%s    email channel needs sendmail or mail (apt: sudo apt-get install -y mailutils)\n' "$_C_YEL" "$_C_OFF"
+        fi ;;
+      exec)
+        [ -x "$NOTIFY_TARGET" ] || printf '  %s[warn]%s    exec target %s is not executable\n' "$_C_YEL" "$_C_OFF" "$NOTIFY_TARGET" ;;
+      "")
+        printf '  %s[warn]%s    NOTIFY_CHANNEL is empty — notifications are disabled\n' "$_C_YEL" "$_C_OFF" ;;
+    esac
+    if [ -f "$RH_CONF" ] && [ -n "$(find "$RH_CONF" -perm -044 2>/dev/null)" ]; then
+      printf '  %s[warn]%s    %s is readable by others — run: chmod 600 %s\n' "$_C_YEL" "$_C_OFF" "$RH_CONF" "$RH_CONF"
+    fi
+  else
+    printf '  %s[missing]%s config     %s — run: repo-health init\n' "$_C_YEL" "$_C_OFF" "$RH_CONF"
+  fi
+  while IFS= read -r n; do [ -n "$n" ] && count=$((count + 1)); done < <(rh_target_names)
+  printf '  [info]    targets    %d registered in %s\n' "$count" "$RH_TARGETS"
+  if ( umask 077; mkdir -p "$REPORT_DIR" ) 2>/dev/null && [ -w "$REPORT_DIR" ]; then
+    printf '  [ok]      reports    %s (writable)\n' "$REPORT_DIR"
+  else
+    printf '  %s[warn]%s    reports    %s is not writable\n' "$_C_YEL" "$_C_OFF" "$REPORT_DIR"
+  fi
+  echo
+  if [ "$required_missing" = 1 ]; then
+    rh_err "curl is required"
+    return 1
+  fi
+  if [ "$missing" -gt 0 ]; then
+    echo "$missing optional tool(s) missing — repo-health works without them, with less coverage."
+  else
+    echo "All tools present."
+  fi
+  return 0
+}
+
+# --- init wizard ------------------------------------------------------------
+
+_rh_random_suffix() {
+  LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6
+}
+
+cmd_init() {
+  local choice channel value prompt rd tries=0 input hurl minute hour n
+  echo "repo-health setup"
+  echo
+  if [ -f "$RH_CONF" ]; then
+    rh_yes "$RH_CONF already exists. Overwrite it? [y/N] " n || { echo "Keeping existing config."; return 0; }
+  fi
+
+  cat <<'EOF'
+Where should alerts go? Every option is free and needs exactly one config value.
+
+  1) ntfy      (recommended) push to phone/desktop via ntfy.sh — no signup, value: a topic name
+  2) webhook   POST JSON {"subject","body"} anywhere (Zapier, n8n, Make…) — value: URL
+  3) slack     Slack incoming webhook — value: https://hooks.slack.com/services/... URL
+  4) discord   Discord channel webhook — value: https://discord.com/api/webhooks/... URL
+  5) telegram  Telegram bot — value: <bot_token>:<chat_id>
+  6) pushover  Pushover app — value: <app_token>:<user_key>
+  7) email     local sendmail/mail command — value: recipient address
+  8) exec      run your own script with subject and body as arguments — value: script path
+
+EOF
+  choice=$(rh_ask "Choose 1-8 [1]: " 1)
+  case "$choice" in
+    1|ntfy) channel=ntfy ;;       2|webhook) channel=webhook ;;
+    3|slack) channel=slack ;;     4|discord) channel=discord ;;
+    5|telegram) channel=telegram ;; 6|pushover) channel=pushover ;;
+    7|email) channel=email ;;     8|exec) channel=exec ;;
+    *) rh_die "invalid choice: $choice" ;;
+  esac
+
+  local default=""
+  case "$channel" in
+    ntfy)
+      default="repo-health-$(id -un 2>/dev/null | rh_slug_stdin)-$(_rh_random_suffix)"
+      prompt="Pick any topic name, e.g. 'joes-repo-health-7x2f' — more random is better since ntfy topics are not access-controlled by default [$default]: " ;;
+    webhook)  prompt="Webhook URL that accepts a JSON POST, e.g. https://hooks.zapier.com/hooks/catch/123/abc/: " ;;
+    slack)    prompt="Slack incoming webhook URL, e.g. https://hooks.slack.com/services/T000/B000/XXXX: " ;;
+    discord)  prompt="Discord webhook URL, e.g. https://discord.com/api/webhooks/1234/abcd: " ;;
+    telegram) prompt="Bot token and chat id joined by ':', e.g. 123456:ABC-your-bot-token:987654321: " ;;
+    pushover) prompt="App token and user key joined by ':', e.g. yourAppToken123:yourUserKey456: " ;;
+    email)    prompt="Recipient address, e.g. you@example.com: " ;;
+    exec)     prompt="Absolute path to an executable script, e.g. /home/you/bin/alert.sh: " ;;
+  esac
+  value=""
+  while [ -z "$value" ]; do
+    value=$(rh_ask "$prompt" "$default")
+    tries=$((tries + 1))
+    [ -n "$value" ] || { [ "$tries" -lt 3 ] || rh_die "no value given"; echo "A value is required."; }
+  done
+
+  rd="$HOME/security-scans"
+  mkdir -p "$(dirname "$RH_CONF")"
+  (
+    umask 077
+    {
+      echo "# repo-health global config — keep private (mode 600, gitignored)."
+      echo "# Channels: ntfy | webhook | slack | discord | telegram | pushover | email | exec"
+      rh_kv NOTIFY_CHANNEL "$channel"
+      rh_kv NOTIFY_TARGET "$value"
+      echo "# Where markdown + JSON scan reports land."
+      echo "REPORT_DIR=~/security-scans"
+      echo "# Optional: semgrep ruleset ('auto' requires semgrep metrics; e.g. p/default runs with --metrics off)."
+      echo "SEMGREP_CONFIG=auto"
+      echo "# Optional: seconds before a health ping counts as DOWN."
+      echo "PING_TIMEOUT=10"
+    } > "$RH_CONF"
+  )
+  chmod 600 "$RH_CONF"
+  rh_ok "wrote $RH_CONF (mode 600)"
+  echo "Verify delivery any time with: repo-health notify-test"
+  echo
+
+  cmd_doctor || true
+  echo
+
+  if rh_yes "Add a target now? [y/N] " n; then
+    input=$(rh_ask "Local repo path, git URL to clone, or health-check URL: " "")
+    case "$input" in
+      "") echo "Nothing entered, skipping." ;;
+      git@*|*.git|ssh://*) cmd_add --git "$input" || true ;;
+      http://*|https://*)
+        if rh_yes "Is this a health-check endpoint (y) or a git repo to clone (n)? [Y/n] " y; then
+          cmd_add --url "$input" || true
+        else
+          cmd_add --git "$input" || true
+        fi ;;
+      *)
+        hurl=$(rh_ask "Health-check URL for this repo too? (blank for none): " "")
+        if [ -n "$hurl" ]; then cmd_add "$input" --url "$hurl" || true; else cmd_add "$input" || true; fi ;;
+    esac
+  else
+    echo "Add targets later with:"
+    echo "  $RH_SELF add /path/to/repo"
+    echo "  $RH_SELF add --git https://github.com/you/project.git"
+    echo "  $RH_SELF add --url https://example.com/up"
+  fi
+
+  # Stagger the nightly scan per install so many installs don't all hit
+  # vulnerability databases at exactly 02:00.
+  n=$(printf '%s' "$(hostname 2>/dev/null)$RH_HOME" | cksum | cut -d' ' -f1)
+  minute=$((n % 60)); hour=$((1 + n / 60 % 4))
+  echo
+  echo "Schedule it (repo-health never edits your crontab). Run 'crontab -e' and add:"
+  echo
+  echo "  $minute $hour * * * $RH_SELF scan --all   # nightly, staggered per install"
+  echo "  */5 * * * * $RH_SELF ping --all # every 5 min"
+  echo
+}
+
+rh_slug_stdin() { rh_slug "$(cat)"; }
+
+# --- dispatch ---------------------------------------------------------------
+
+main() {
+  local cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    init)                 cmd_init "$@" ;;
+    doctor)               cmd_doctor "$@" ;;
+    add)                  cmd_add "$@" ;;
+    list|ls)              cmd_list "$@" ;;
+    remove|rm)            cmd_remove "$@" ;;
+    edit)                 cmd_edit "$@" ;;
+    scan)                 cmd_scan "$@" ;;
+    ping)                 cmd_ping "$@" ;;
+    notify-test)          cmd_notify_test "$@" ;;
+    version|--version|-V) echo "repo-health $RH_VERSION" ;;
+    help|--help|-h)       usage ;;
+    *)                    rh_err "unknown command: $cmd"; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

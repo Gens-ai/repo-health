@@ -1,0 +1,33 @@
+# repo-health global config template.
+#
+#   cp repo-health.conf.example repo-health.conf && chmod 600 repo-health.conf
+#
+# or just run `repo-health init`, which writes this file for you.
+# repo-health.conf is gitignored: it may contain tokens, never commit it.
+# The file is parsed as KEY=value lines (never executed as shell).
+
+# Notification channel:
+#   ntfy | webhook | slack | discord | telegram | pushover | email | exec
+NOTIFY_CHANNEL=ntfy
+
+# The channel's single config value:
+#   ntfy      topic name (e.g. joes-repo-health-7x2f) or a full URL for a self-hosted server
+#   webhook   URL that accepts a JSON POST {"subject": "...", "body": "..."}
+#   slack     https://hooks.slack.com/services/... incoming-webhook URL
+#   discord   https://discord.com/api/webhooks/... webhook URL
+#   telegram  <bot_token>:<chat_id>
+#   pushover  <app_token>:<user_key>
+#   email     recipient address (uses local sendmail or mail)
+#   exec      path to an executable; called as: script "<subject>" "<body>"
+NOTIFY_TARGET=change-me-to-a-random-topic-name
+
+# Where markdown + JSON scan reports are written.
+REPORT_DIR=~/security-scans
+
+# Optional: semgrep ruleset. "auto" picks rules for your languages but requires
+# semgrep's anonymous metrics; any other value (e.g. p/default) runs with
+# --metrics off.
+SEMGREP_CONFIG=auto
+
+# Optional: seconds before a health ping counts as DOWN.
+PING_TIMEOUT=10

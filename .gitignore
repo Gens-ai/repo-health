@@ -1,0 +1,7 @@
+# Local config and runtime state — may contain tokens, never commit.
+repo-health.conf
+targets.d/*.conf
+targets.d/*.state
+cache/
+*.log
+security-scans/
