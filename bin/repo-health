@@ -93,7 +93,7 @@ rh_kv() {
 }
 
 RH_GLOBAL_KEYS="NOTIFY_CHANNEL NOTIFY_TARGET REPORT_DIR SEMGREP_CONFIG PING_TIMEOUT"
-RH_TARGET_KEYS="NAME MODE PATH HEALTH_URL HEALTH_STATUS_JSONPATH HEALTH_AUTH_HEADER GIT_URL"
+RH_TARGET_KEYS="NAME MODE PATH HEALTH_URL HEALTH_STATUS_JSONPATH HEALTH_AUTH_HEADER GIT_URL BRANCH"
 
 rh_load_global() {
   NOTIFY_CHANNEL="" NOTIFY_TARGET="" REPORT_DIR="$HOME/security-scans" SEMGREP_CONFIG=auto PING_TIMEOUT=10
@@ -132,7 +132,7 @@ rh_target_names() {
 rh_load_target() {
   local file
   file=$(rh_target_file "$1")
-  T_NAME="" T_MODE="" T_PATH="" T_HEALTH_URL="" T_HEALTH_STATUS_JSONPATH="" T_HEALTH_AUTH_HEADER="" T_GIT_URL=""
+  T_NAME="" T_MODE="" T_PATH="" T_HEALTH_URL="" T_HEALTH_STATUS_JSONPATH="" T_HEALTH_AUTH_HEADER="" T_GIT_URL="" T_BRANCH=""
   [ -f "$file" ] || return 1
   rh_parse_conf "$file" T_ $RH_TARGET_KEYS || return 1
   [ -n "$T_NAME" ] || T_NAME=$1
@@ -157,6 +157,12 @@ rh_write_target() {
       printf '# Optional: "Header-Name: ENV_VAR_NAME" — the value is read from that env var, never stored here\n'
       rh_kv HEALTH_AUTH_HEADER "$T_HEALTH_AUTH_HEADER"
       [ -n "$T_GIT_URL" ] && rh_kv GIT_URL "$T_GIT_URL"
+      if [ -n "$T_BRANCH" ]; then
+        printf '# Pinned branch. --git targets: cloned/refreshed from this branch.\n'
+        printf '# Local <path> targets: checked before each scan, never force-switched —\n'
+        printf '# a mismatch is a warning, not an error, so your working tree is never touched.\n'
+        rh_kv BRANCH "$T_BRANCH"
+      fi
     } > "$file"
   )
   chmod 600 "$file"
@@ -195,7 +201,7 @@ Usage:
   repo-health notify-test                       send a test notification
   repo-health version | help
 
-add options:   --name X  --jsonpath .data.ok  --auth-header "X-Token: ENV_VAR"  --force
+add options:   --name X  --branch main  --jsonpath .data.ok  --auth-header "X-Token: ENV_VAR"  --force
 scan options:  --notify (notify new findings for a single target)  --no-notify  --report-dir DIR
 
 Config: $RH_CONF
@@ -204,12 +210,13 @@ EOF
 }
 
 cmd_add() {
-  local path="" git="" url="" name="" jsonpath="" auth="" force=0 file host
+  local path="" git="" url="" name="" jsonpath="" auth="" branch="" force=0 file host
   while [ $# -gt 0 ]; do
     case "$1" in
       --git)          [ $# -ge 2 ] || rh_die "--git needs a URL"; git=$2; shift 2 ;;
       --url)          [ $# -ge 2 ] || rh_die "--url needs a URL"; url=$2; shift 2 ;;
       --name)         [ $# -ge 2 ] || rh_die "--name needs a value"; name=$2; shift 2 ;;
+      --branch)       [ $# -ge 2 ] || rh_die "--branch needs a value"; branch=$2; shift 2 ;;
       --jsonpath)     [ $# -ge 2 ] || rh_die "--jsonpath needs a value"; jsonpath=$2; shift 2 ;;
       --auth-header)  [ $# -ge 2 ] || rh_die "--auth-header needs a value"; auth=$2; shift 2 ;;
       --force|-f)     force=1; shift ;;
@@ -255,15 +262,25 @@ cmd_add() {
       rm -rf "$path"
     fi
     ( umask 077; mkdir -p "$RH_CACHE" )
-    rh_info "cloning $git (shallow) into $path…"
-    git clone --depth 1 -q -- "$git" "$path" || rh_die "git clone failed"
+    if [ -n "$branch" ]; then
+      rh_info "cloning $git (shallow, branch $branch) into $path…"
+      git clone --depth 1 -q --branch "$branch" -- "$git" "$path" || rh_die "git clone failed (check the branch name)"
+    else
+      rh_info "cloning $git (shallow) into $path…"
+      git clone --depth 1 -q -- "$git" "$path" || rh_die "git clone failed"
+    fi
   elif [ -n "$path" ]; then
     [ -d "$path" ] || rh_die "not a directory: $path"
     path=$(cd "$path" && pwd -P)
+    if [ -n "$branch" ] && [ -d "$path/.git" ]; then
+      local current
+      current=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || current=""
+      [ "$current" = "$branch" ] || rh_warn "'$path' is currently on branch '$current', not '$branch' — repo-health will warn (not switch) on every scan until they match"
+    fi
   fi
 
   T_NAME=$name T_PATH=$path T_HEALTH_URL=$url T_HEALTH_STATUS_JSONPATH=$jsonpath
-  T_HEALTH_AUTH_HEADER=$auth T_GIT_URL=$git
+  T_HEALTH_AUTH_HEADER=$auth T_GIT_URL=$git T_BRANCH=$branch
   if [ -n "$path" ] && [ -n "$url" ]; then T_MODE=both
   elif [ -n "$path" ]; then T_MODE=scan
   else T_MODE=ping
@@ -340,11 +357,32 @@ cmd_edit() {
 }
 
 # _rh_refresh_clone — update a repo-health-managed shallow clone before scanning.
+# With BRANCH set, always fetches and resets to that branch specifically, so a
+# clone never silently drifts onto the remote's default branch.
 _rh_refresh_clone() {
   [ -n "$T_GIT_URL" ] && [ "$T_PATH" = "$RH_CACHE/$T_NAME" ] && [ -d "$T_PATH/.git" ] || return 0
-  rh_info "updating clone of $T_GIT_URL…"
-  if ! { git -C "$T_PATH" fetch -q --depth 1 origin && git -C "$T_PATH" reset -q --hard FETCH_HEAD; }; then
-    rh_warn "$T_NAME: could not update clone, scanning the existing copy"
+  if [ -n "$T_BRANCH" ]; then
+    rh_info "updating clone of $T_GIT_URL (branch $T_BRANCH)…"
+    if ! { git -C "$T_PATH" fetch -q --depth 1 origin "$T_BRANCH" && git -C "$T_PATH" reset -q --hard FETCH_HEAD; }; then
+      rh_warn "$T_NAME: could not update clone to branch '$T_BRANCH', scanning the existing copy"
+    fi
+  else
+    rh_info "updating clone of $T_GIT_URL…"
+    if ! { git -C "$T_PATH" fetch -q --depth 1 origin && git -C "$T_PATH" reset -q --hard FETCH_HEAD; }; then
+      rh_warn "$T_NAME: could not update clone, scanning the existing copy"
+    fi
+  fi
+}
+
+# _rh_check_branch — for a local (non-cache) target with BRANCH set, warn if the
+# working tree isn't on that branch. Never switches branches itself: the repo
+# may have uncommitted work, so this is purely advisory.
+_rh_check_branch() {
+  [ -n "$T_BRANCH" ] && [ -n "$T_PATH" ] && [ "$T_PATH" != "$RH_CACHE/$T_NAME" ] && [ -d "$T_PATH/.git" ] || return 0
+  local current
+  current=$(git -C "$T_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+  if [ "$current" != "$T_BRANCH" ]; then
+    rh_warn "$T_NAME: expected branch '$T_BRANCH' but '$T_PATH' is on '$current' — scanning '$current' anyway (repo-health never switches branches on a local checkout)"
   fi
 }
 
@@ -389,6 +427,7 @@ cmd_scan() {
       rh_load_target "$n" || continue
       case "$T_MODE" in scan|both) ;; *) continue ;; esac
       _rh_refresh_clone
+      _rh_check_branch
       _scan_one "$n" "$T_PATH"
     done < <(rh_target_names)
     [ "$any" = 1 ] || rh_info "no scan-mode targets registered (repo-health add <path>)"
@@ -396,6 +435,7 @@ cmd_scan() {
     rh_load_target "$target" || rh_die "invalid target config for $target"
     case "$T_MODE" in scan|both) ;; *) rh_die "target '$target' is ping-only (MODE=$T_MODE)" ;; esac
     _rh_refresh_clone
+    _rh_check_branch
     _scan_one "$target" "$T_PATH"
   elif [ -d "$target" ]; then
     # Ad-hoc path (CI usage: `repo-health scan .`) — no registration needed.

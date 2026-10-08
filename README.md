@@ -54,6 +54,69 @@ Cron has a minimal environment. If trivy/semgrep live in `~/.local/bin`, add a
 define those variables there too. Each run appends a one-line summary to
 `repo-health.log` in the repo-health home directory.
 
+## How it works
+
+repo-health is a single bash script plus a few sourced libraries — no
+database, no daemon, no background service. Everything is flat files:
+
+- **`repo-health.conf`** — one global config file (notify channel, report
+  directory, etc.), written by `init`, parsed (never executed — a target's
+  `PATH=` key would otherwise clobber your shell's `$PATH`).
+- **`targets.d/<name>.conf`** — one file per registered target, written by
+  `add`/`edit`. Each just points at a local directory, a git URL, and/or a
+  health-check URL.
+- **`targets.d/<name>.state`** — last-known health-ping status, so pings
+  only notify on a *change* (DOWN, DEGRADED, recovered), not on every poll.
+- **`cache/<name>/`** — only exists for `add --git` targets: a shallow
+  (`--depth 1`) clone that repo-health owns. It's refreshed in place
+  (`fetch` + `reset --hard`) before every scan, not deleted and re-cloned,
+  and only ever removed by `repo-health remove <name>`. Local `add <path>`
+  targets are never touched here — repo-health reads them, never clones or
+  modifies them.
+- **`<REPORT_DIR>/<name>-<timestamp>.md` and `.json`** — one report pair per
+  scan run. The JSON from the previous run is what `scan --all` diffs
+  against to decide what counts as a "new" finding worth notifying about.
+
+**A scan run, in order:** refresh the git cache (if any) → warn (not switch)
+if a local target's checked-out branch doesn't match a pinned `BRANCH` →
+detect the stack (which lockfiles/manifests exist) → run trivy `fs` →
+run trivy `config` if a Dockerfile/compose file exists → run semgrep if
+installed → run the matching native audit command(s) (`composer audit`,
+`npm audit`, `pip-audit`) → merge everything into one report → diff against
+the last JSON report → notify on new findings → exit non-zero if anything
+HIGH/CRITICAL remains.
+
+**A ping run:** GET the health URL → classify the response (fleet contract →
+IETF draft → custom `HEALTH_STATUS_JSONPATH` → generic 2xx fallback) →
+compare against the stored last-known state → notify only on a change →
+exit non-zero if DOWN.
+
+Nothing phones home. The only network calls are: the scanners' own
+vulnerability-database downloads/updates (trivy, semgrep if `--config auto`),
+`git fetch` for `--git` targets, the health URLs you configure, and whichever
+notification channel you picked. No telemetry from repo-health itself.
+
+### Pinning a branch
+
+By default, a `--git` target tracks whatever branch it was cloned from
+(usually the repo's default branch), and a local `add <path>` target is
+scanned on whatever branch happens to be checked out at scan time — which
+can silently drift. `--branch` fixes that:
+
+```bash
+repo-health add --git https://github.com/you/project.git --branch main
+repo-health add /path/to/local/repo --branch main
+```
+
+- **`--git` targets:** cloned from that branch, and every later `scan`
+  re-fetches and hard-resets to that same branch specifically — it can
+  never drift onto the remote's default branch.
+- **Local `<path>` targets:** repo-health **never force-switches a local
+  checkout** (it might have uncommitted work). Instead, before each scan it
+  checks the currently checked-out branch and prints a warning if it
+  doesn't match — then scans whatever is actually checked out anyway. The
+  warning is your signal to `git checkout <branch>` yourself.
+
 ## Subcommand reference
 
 | Command | What it does |
@@ -73,7 +136,7 @@ define those variables there too. Each run appends a one-line summary to
 
 Extra options:
 
-- `add`: `--name X`, `--jsonpath .data.ok`, `--auth-header "X-Health-Token: MY_ENV_VAR"`, `--force` (replace an existing target / re-clone).
+- `add`: `--name X`, `--branch main` (see [Pinning a branch](#pinning-a-branch)), `--jsonpath .data.ok`, `--auth-header "X-Health-Token: MY_ENV_VAR"`, `--force` (replace an existing target / re-clone).
 - `scan`: `--notify` (send the new-findings notification for a single target too), `--no-notify`, `--report-dir DIR`.
 
 Exit codes: `0` OK, `1` HIGH/CRITICAL findings (scan) or a DOWN target (ping), `2` usage/config error.
@@ -120,6 +183,7 @@ drop files into `targets.d/` directly.
 | `HEALTH_STATUS_JSONPATH` | `.data.ok` | Optional. A jq path to the status field for custom JSON shapes (see [Custom shapes](#anything-else-health_status_jsonpath)). |
 | `HEALTH_AUTH_HEADER` | `X-Health-Token: UPWORK_HEALTH_TOKEN` | Optional. `Header-Name: ENV_VAR_NAME`. The part after the colon is the **name of an environment variable**; at ping time repo-health reads that variable and sends its value as the header. The secret itself is never written to the target file. repo-health passes it to curl through a temporary mode-600 file, so it never shows up in `ps`. If the variable is unset, the target is reported DOWN with a clear message. With cron, define the variable at the top of your crontab or in a wrapper script. |
 | `GIT_URL` | `https://github.com/you/app.git` | Set by `add --git`. When set, and `PATH` is repo-health's own cache clone, the clone is refreshed before each scan. |
+| `BRANCH` | `main` | Optional, set by `--branch`. For `--git` targets: the clone is always fetched/reset to this branch. For local `PATH` targets: never force-switched — a mismatch against the currently checked-out branch just prints a warning before scanning anyway. See [Pinning a branch](#pinning-a-branch). |
 
 A third kind of file, `targets.d/<name>.state`, is written by `ping` to remember
 the last known status. Don't edit it.
